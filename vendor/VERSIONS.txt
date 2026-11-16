@@ -1,0 +1,4 @@
+Bundled so the app never contacts a CDN.
+- zxing-wasm-reader.js, zxing_reader.wasm: zxing-wasm 3.1.6 (MIT), reader-only IIFE build.
+  scanner.js overrides locateFile so the .wasm is always loaded from ./vendor/zxing_reader.wasm
+  (the library's default jsDelivr path is never used).
