@@ -43,30 +43,40 @@
     return { 'Accept': 'application/json' };
   }
 
-  // Looks up a barcode. Returns { ok, title } or { ok:false, reason, code }.
+  function relayCacheHeader(res) {
+    var v = (res && res.headers && res.headers.get('x-relay-cache') || '').toLowerCase();
+    return (v === 'hit' || v === 'miss') ? v : null;
+  }
+
+  // Looks up a barcode. Returns { ok, title, cache, resetAt } or
+  // { ok:false, reason, code, cache, resetAt }.
   // reason is 'no-relay' | 'offline' | 'not_found' | 'busy' | 'upstream_busy' | 'daily_limit' |
   //           'invalid' | 'upstream' | 'http'.
+  // cache is 'hit' | 'miss' | null from the relay's x-relay-cache header
+  // (a hit is free for the batch-scan queue: the next item can go sooner).
   function lookupBarcode(code) {
     var digits = String(code || '').replace(/\D/g, '');
     var origin = relayOrigin();
     if (!origin) {
-      return Promise.resolve({ ok: false, reason: 'no-relay', code: digits });
+      return Promise.resolve({ ok: false, reason: 'no-relay', code: digits, cache: null, resetAt: null });
     }
     var url = origin + '/upc?code=' + encodeURIComponent(digits);
     return fetch(url, { headers: relayHeaders() }).then(function (res) {
       return res.json().catch(function () { return null; }).then(function (data) {
+        var cache = relayCacheHeader(res);
+        var resetAt = (data && data.resetAt) || null;
         if (res.ok) {
-          if (!data || !data.title) return { ok: false, reason: 'not_found', code: digits };
-          return { ok: true, title: String(data.title) };
+          if (!data || !data.title) return { ok: false, reason: 'not_found', code: digits, cache: cache, resetAt: resetAt };
+          return { ok: true, title: String(data.title), cache: cache, resetAt: resetAt };
         }
         var err = data && data.error;
         // The relay says who refused: UPCitemdb's shared free limit, or our own limiter.
         if (err === 'busy' && data && data.cause === 'upstream_busy') err = 'upstream_busy';
         var known = { not_found: 1, busy: 1, upstream_busy: 1, daily_limit: 1, invalid: 1, upstream: 1 };
-        return { ok: false, reason: known[err] ? err : 'http', status: res.status, code: digits };
+        return { ok: false, reason: known[err] ? err : 'http', status: res.status, code: digits, cache: cache, resetAt: resetAt };
       });
     }).catch(function () {
-      return { ok: false, reason: 'offline', code: digits };
+      return { ok: false, reason: 'offline', code: digits, cache: null, resetAt: null };
     });
   }
 

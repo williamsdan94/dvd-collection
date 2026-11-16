@@ -1,9 +1,10 @@
 /* My DVDs ("Do I own it?") — the app itself.
-   Screens: Home (search + cover grid), Scan, Missed (type the title),
-   Found (add / already own), Detail, Edit, Settings.
-   The list and covers live in this phone's IndexedDB. A GitHub key, when
-   pasted in Settings, is also stored only here — never in the public site
-   or in a backup file. */
+   Screens: Home (search + cover grid), Scan, Batch scan, Queue, Missed
+   (type the title), Found (add / already own), Detail, Edit, Settings.
+   The list, covers, and the batch-scan queue live in this phone's IndexedDB.
+   A GitHub key, when pasted in Settings, is also stored only here — never
+   in the public site or in a backup file. The scan queue stays on this
+   phone and is not part of the GitHub backup. */
 (function () {
   'use strict';
 
@@ -82,19 +83,40 @@
   // dvds: the list. covers: JPEG blobs. settings: githubToken, githubOwner,
   // githubRepo, lastBackupAt, lastRestoreAt, backupPending (the key lives only
   // in this settings store, never in the public site or a backup file).
+  // scanQueue: barcodes waiting to be looked up in Batch scan. Kept on this
+  // phone only — not included in the GitHub backup (in-progress state would
+  // fight with restore and the shrink guards).
   var dbPromise = null;
+  var DB_VERSION = 2;
+  var dbClosedByVersionChange = false;
+  function attachDbLifecycle(d) {
+    d.onversionchange = function () {
+      d.close();
+      dbClosedByVersionChange = true;
+      dbPromise = null;
+    };
+  }
   function db() {
     if (!dbPromise) {
       dbPromise = new Promise(function (resolve, reject) {
-        var req = indexedDB.open('my-dvds', 1);
+        var req = indexedDB.open('my-dvds', DB_VERSION);
         req.onupgradeneeded = function () {
           var d = req.result;
+          attachDbLifecycle(d);
           if (!d.objectStoreNames.contains('dvds')) d.createObjectStore('dvds', { keyPath: 'id' });
           if (!d.objectStoreNames.contains('covers')) d.createObjectStore('covers', { keyPath: 'id' });
           if (!d.objectStoreNames.contains('settings')) d.createObjectStore('settings', { keyPath: 'key' });
+          if (!d.objectStoreNames.contains('scanQueue')) d.createObjectStore('scanQueue', { keyPath: 'id' });
         };
-        req.onsuccess = function () { resolve(req.result); };
+        req.onsuccess = function () {
+          var d = req.result;
+          attachDbLifecycle(d);
+          resolve(d);
+        };
         req.onerror = function () { reject(req.error); };
+        req.onblocked = function () {
+          toast('Close other My DVDs tabs and reopen.');
+        };
       });
     }
     return dbPromise;
@@ -138,6 +160,13 @@
       t.objectStore('settings').put({ key: key, value: value });
     });
   }
+  function getAllQueue() { return tx(['scanQueue'], 'readonly', function (t) { return t.objectStore('scanQueue').getAll(); }); }
+  function putQueueItem(item) {
+    return tx(['scanQueue'], 'readwrite', function (t) { t.objectStore('scanQueue').put(item); });
+  }
+  function deleteQueueItem(id) {
+    return tx(['scanQueue'], 'readwrite', function (t) { t.objectStore('scanQueue').delete(id); });
+  }
 
   // ---------- App state ----------
   var dvds = [];
@@ -161,6 +190,20 @@
   var ghHelpOpen = false;
   var tokenDraft = '';
   var objectUrls = [];
+  var queueItems = [];
+  var batchStatus = '';
+  var batchFlashTimer = null;
+  var audioCtx = null;
+  var queueTimer = null;
+  var queueRunning = false;
+  var queuePaused = false;
+  var lastMissAt = 0;
+  var busyStrike = 0;
+  var pausedUntil = 0;
+  var pauseReason = '';
+  var dailyResetAt = null;
+  var QUEUE_MISS_GAP = 15000;
+  var QUEUE_BUSY = [30000, 60000, 120000, 300000];
   var DEFAULT_OWNER = 'williamsdan94';
   var DEFAULT_REPO = 'dvd-backup';
   var GH_API = 'https://api.github.com';
@@ -174,7 +217,7 @@
     var u = URL.createObjectURL(blob); objectUrls.push(u); return u;
   }
   function show(next) {
-    if (view === 'scan' && next !== 'scan' && window.DvdScan) DvdScan.stopCamera();
+    if ((view === 'scan' || view === 'batch-scan') && next !== view && window.DvdScan) DvdScan.stopCamera();
     objectUrls.forEach(function (u) { URL.revokeObjectURL(u); });
     objectUrls = [];
     view = next;
@@ -340,6 +383,8 @@
   function render() {
     if (view === 'home') return renderHome();
     if (view === 'scan') return renderScan();
+    if (view === 'batch-scan') return renderBatchScan();
+    if (view === 'queue') return renderQueue();
     if (view === 'looking') return renderLooking();
     if (view === 'missed') return renderMissed();
     if (view === 'found') return renderFound();
@@ -377,6 +422,8 @@
       '<div id="results" class="results"></div>' +
       '<div class="scanbar"><div class="scanbar-inner">' +
       '<button type="button" class="btn-big" data-action="scan">📷 Scan barcode</button>' +
+      '<button type="button" class="btn-small" data-action="batch-scan">Batch scan</button>' +
+      '<button type="button" class="btn-small" data-action="queue" id="home-queue-btn">' + esc(queueButtonLabel()) + '</button>' +
       '</div></div>';
     renderResults();
   }
@@ -477,6 +524,441 @@
     el.hidden = !scanError;
   }
 
+  function queueButtonLabel() {
+    var n = queueCounts().waiting;
+    if (n > 0) return 'Queue (' + n + ' waiting)';
+    if (queueItems.length) return 'Queue (' + queueItems.length + ')';
+    return 'Queue';
+  }
+
+  function queueCounts() {
+    var c = { waiting: 0, found: 0, not_found: 0, duplicate: 0, error: 0, total: queueItems.length };
+    queueItems.forEach(function (i) { if (c[i.status] != null) c[i.status] += 1; });
+    return c;
+  }
+
+  function queueStatusLabel(st) {
+    if (st === 'waiting') return 'Waiting';
+    if (st === 'found') return 'Found (added)';
+    if (st === 'not_found') return 'Not found';
+    if (st === 'duplicate') return 'Duplicate (skipped)';
+    if (st === 'error') return 'Error';
+    return st || '';
+  }
+
+  function nextUtcMidnightIso(now) {
+    var d = new Date(now || Date.now());
+    var next = Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate() + 1, 0, 0, 0);
+    return new Date(next).toISOString();
+  }
+
+  function unlockAudio() {
+    try {
+      var AC = window.AudioContext || window.webkitAudioContext;
+      if (!AC) return;
+      if (!audioCtx) audioCtx = new AC();
+      if (audioCtx.state === 'suspended') audioCtx.resume().catch(function () {});
+    } catch (e) {}
+  }
+
+  function beepQueue() {
+    try { if (navigator.vibrate) navigator.vibrate(40); } catch (e) {}
+    try {
+      if (!audioCtx || audioCtx.state === 'suspended') return;
+      var o = audioCtx.createOscillator();
+      var g = audioCtx.createGain();
+      o.type = 'sine';
+      o.frequency.value = 880;
+      g.gain.setValueAtTime(0.08, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.09);
+      o.connect(g); g.connect(audioCtx.destination);
+      o.start();
+      o.stop(audioCtx.currentTime + 0.1);
+    } catch (e) {}
+  }
+
+  function setBatchStatus(msg) {
+    batchStatus = msg || '';
+    var el = document.getElementById('batch-status');
+    if (el) { el.textContent = batchStatus; el.hidden = !batchStatus; }
+    clearTimeout(batchFlashTimer);
+    if (batchStatus) {
+      batchFlashTimer = setTimeout(function () {
+        if (batchStatus === msg) {
+          batchStatus = '';
+          var e2 = document.getElementById('batch-status');
+          if (e2) { e2.textContent = ''; e2.hidden = true; }
+        }
+      }, 2500);
+    }
+  }
+
+  function renderBatchScan() {
+    app.innerHTML =
+      '<div class="topbar"><button type="button" class="link" data-action="home">Back</button>' +
+      '<h2>Batch scan</h2>' +
+      '<button type="button" class="link" data-action="queue">Queue</button></div>' +
+      '<div class="scan-screen">' +
+      '<div class="viewfinder">' +
+      '<video id="cam" playsinline muted autoplay></video>' +
+      '<div class="guide-box" aria-hidden="true"></div>' +
+      '<p class="scan-hint">Keep lining up barcodes. Each good one is added to the Queue.</p>' +
+      '</div>' +
+      '<p class="batch-status" id="batch-status"' + (batchStatus ? '' : ' hidden') + '>' + esc(batchStatus) + '</p>' +
+      '<p class="scan-error" id="scan-error"' + (scanError ? '' : ' hidden') + '>' + esc(scanError) + '</p>' +
+      '<div class="scan-actions">' +
+      '<button type="button" class="btn-small" data-action="queue">View queue</button>' +
+      '</div></div>';
+    var video = document.getElementById('cam');
+    if (!window.DvdScan) {
+      setScanError('Scanner library failed to load.');
+      return;
+    }
+    DvdScan.startCamera(video, function (hit) {
+      if (!hit || !hit.text) return;
+      if (view !== 'batch-scan') return;
+      enqueueBarcode(hit.text);
+    }).catch(function (err) {
+      if (err && err.kind === 'library') {
+        setScanError('The barcode scanner didn\'t load. Close the app, open it again, and retry.');
+      } else if (err && err.name === 'NotAllowedError') {
+        setScanError('Camera access is off. Allow the camera for this app in Settings.');
+      } else {
+        setScanError('Camera is not available.');
+      }
+    });
+  }
+
+  function queuePauseMessage() {
+    if (pauseReason === 'daily_limit') {
+      var when = niceDateTime(dailyResetAt || (pausedUntil ? new Date(pausedUntil).toISOString() : ''));
+      return when ? ('Daily lookup limit reached. Lookups pause until ' + when + '.') : 'Daily lookup limit reached. Lookups pause until the reset.';
+    }
+    if ((pauseReason === 'busy' || pauseReason === 'temp') && pausedUntil > Date.now()) {
+      var secs = Math.max(1, Math.round((pausedUntil - Date.now()) / 1000));
+      if (pauseReason === 'temp') {
+        return 'Couldn\'t look it up right now. Trying again in about ' + secs + ' second' + (secs === 1 ? '' : 's') + '.';
+      }
+      return 'The barcode database is busy. Trying again in about ' + secs + ' second' + (secs === 1 ? '' : 's') + '.';
+    }
+    return '';
+  }
+
+  function renderQueue() {
+    var c = queueCounts();
+    var items = queueItems.slice().sort(function (a, b) { return (a.createdAt || '') < (b.createdAt || '') ? 1 : -1; });
+    var pause = queuePauseMessage();
+    var finished = c.found + c.duplicate;
+    var body;
+    if (!items.length) {
+      body = '<p class="empty">No barcodes in the queue yet. Tap Batch scan to add some.</p>';
+    } else {
+      body = '<ul class="queue-list">' + items.map(function (i) {
+        var actions = '<div class="queue-actions">';
+        if (i.status === 'not_found') {
+          actions += '<button type="button" class="btn-small" data-action="queue-type-title" data-id="' + esc(i.id) + '">Type the title</button>';
+        }
+        if (i.status === 'not_found' || i.status === 'error' || i.status === 'waiting') {
+          actions += '<button type="button" class="btn-small" data-action="queue-retry" data-id="' + esc(i.id) + '">Retry</button>';
+        }
+        actions += '<button type="button" class="btn-small" data-action="queue-remove" data-id="' + esc(i.id) + '">Remove</button>';
+        actions += '</div>';
+        return '<li class="queue-item" data-queue-id="' + esc(i.id) + '" data-status="' + esc(i.status) + '">' +
+          '<p class="queue-code">Barcode ' + esc(i.barcode || '') + '</p>' +
+          '<p class="queue-status">' + esc(queueStatusLabel(i.status)) + (i.ownedLabel ? (' · ' + i.ownedLabel) : (i.title ? (' · ' + i.title) : '')) + '</p>' +
+          actions + '</li>';
+      }).join('') + '</ul>';
+    }
+    app.innerHTML =
+      '<div class="topbar"><button type="button" class="link" data-action="home">Back</button>' +
+      '<h2>Queue</h2>' +
+      '<button type="button" class="link" data-action="batch-scan">Scan</button></div>' +
+      '<div class="queue-counts" id="queue-counts">' +
+      'Waiting ' + c.waiting + ' · Found ' + c.found + ' · Not found ' + c.not_found +
+      ' · Duplicate ' + c.duplicate + ' · Error ' + c.error + '</div>' +
+      (pause ? '<p class="msg queue-pause" id="queue-pause">' + esc(pause) + '</p>' : '') +
+      body +
+      '<div class="footer"><div>' +
+      (finished ? '<button type="button" class="btn-small" data-action="clear-finished">Clear finished</button>' : '') +
+      '<button type="button" class="btn-big" data-action="batch-scan">Batch scan</button>' +
+      '</div></div>';
+  }
+
+  function refreshQueueChrome() {
+    if (view === 'queue') renderQueue();
+    else if (view === 'home') {
+      var btn = document.getElementById('home-queue-btn');
+      if (btn) btn.textContent = queueButtonLabel();
+    } else if (view === 'batch-scan') {
+      var el = document.getElementById('batch-status');
+      if (el && batchStatus) { el.textContent = batchStatus; el.hidden = false; }
+    }
+  }
+
+  function findQueueItem(id) {
+    for (var i = 0; i < queueItems.length; i++) if (queueItems[i].id === id) return queueItems[i];
+    return null;
+  }
+
+  function enqueueBarcode(raw, opts) {
+    opts = opts || {};
+    var code = String(raw || '').replace(/\D/g, '');
+    if (window.DvdScan && typeof DvdScan.normalizeRead === 'function') {
+      var norm = DvdScan.normalizeRead(code, '');
+      if (!norm) {
+        if (!opts.fromTest) toast('That barcode number doesn\'t look valid.');
+        setBatchStatus('That barcode number doesn\'t look valid.');
+        return Promise.resolve({ ok: false, reason: 'invalid' });
+      }
+      code = norm;
+    } else if (!code) {
+      return Promise.resolve({ ok: false, reason: 'invalid' });
+    }
+    var nb = normalizeBarcode(code);
+    var existing = null, i;
+    for (i = 0; i < queueItems.length; i++) {
+      if (normalizeBarcode(queueItems[i].barcode) === nb) { existing = queueItems[i]; break; }
+    }
+    if (existing) {
+      toast('That barcode is already in the queue');
+      setBatchStatus('Already in the queue');
+      return Promise.resolve({ ok: false, reason: 'in_queue', id: existing.id });
+    }
+    var owned = findDuplicate('', '', code, null);
+    var item = {
+      id: newId(),
+      barcode: code,
+      status: owned ? 'duplicate' : 'waiting',
+      title: owned ? owned.item.title : '',
+      year: owned ? (owned.item.year || '') : '',
+      addedId: owned ? owned.item.id : null,
+      ownedLabel: owned ? ('Already own: ' + owned.item.title) : '',
+      createdAt: isoNow(),
+      updatedAt: isoNow()
+    };
+    queueItems.push(item);
+    return putQueueItem(item).then(function () {
+      beepQueue();
+      if (owned) {
+        toast('You already own “' + owned.item.title + '”. Skipped.');
+        setBatchStatus('Already owned — skipped');
+      } else {
+        setBatchStatus('Added to the queue');
+        kickQueue();
+      }
+      refreshQueueChrome();
+      return { ok: true, item: item, skipped: !!owned };
+    });
+  }
+
+  function setQueueTimingInternal(opts) {
+    if (!opts) return;
+    if (opts.missGap != null) QUEUE_MISS_GAP = Number(opts.missGap);
+    if (opts.busyBackoffs) QUEUE_BUSY = opts.busyBackoffs.slice();
+  }
+
+  function kickQueue() {
+    if (queuePaused) return;
+    if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; }
+    var now = Date.now();
+    var delay = 0;
+    if (pausedUntil > now) delay = pausedUntil - now;
+    else if (lastMissAt && now - lastMissAt < QUEUE_MISS_GAP) delay = QUEUE_MISS_GAP - (now - lastMissAt);
+    queueTimer = setTimeout(function () { queueTimer = null; runQueueTick(); }, delay);
+  }
+
+  function resumeQueue(why) {
+    queuePaused = false;
+    var now = Date.now();
+    if (pauseReason === 'daily_limit' && dailyResetAt && now < Date.parse(dailyResetAt)) {
+      pausedUntil = Date.parse(dailyResetAt);
+    } else if (pauseReason === 'daily_limit' && dailyResetAt && now >= Date.parse(dailyResetAt)) {
+      pauseReason = '';
+      pausedUntil = 0;
+      dailyResetAt = null;
+    }
+    kickQueue();
+    if (view === 'queue') renderQueue();
+  }
+
+  function runQueueTick() {
+    if (queuePaused || queueRunning) return;
+    if (typeof document !== 'undefined' && document.hidden) return;
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    var now = Date.now();
+    if (pauseReason === 'daily_limit' && dailyResetAt) {
+      var resetMs = Date.parse(dailyResetAt);
+      if (isFinite(resetMs) && now < resetMs) {
+        pausedUntil = resetMs;
+        kickQueue();
+        if (view === 'queue') renderQueue();
+        return;
+      }
+      pauseReason = '';
+      pausedUntil = 0;
+      dailyResetAt = null;
+    }
+    if (pausedUntil > now) { kickQueue(); return; }
+    if (lastMissAt && now - lastMissAt < QUEUE_MISS_GAP) { kickQueue(); return; }
+
+    var waiting = queueItems.filter(function (q) { return q.status === 'waiting'; })
+      .sort(function (a, b) { return (a.createdAt || '') < (b.createdAt || '') ? -1 : 1; });
+    var item = waiting[0];
+    if (!item) return;
+
+    var owned = findDuplicate('', '', item.barcode, null);
+    if (owned) {
+      markQueueDuplicate(item, owned);
+      putQueueItem(item).then(function () { refreshQueueChrome(); kickQueue(); });
+      return;
+    }
+
+    queueRunning = true;
+    item.updatedAt = isoNow();
+    DvdLookup.lookupBarcode(item.barcode).then(function (res) {
+      // A cache hit is free. Everything else (a miss, or a response with no
+      // x-relay-cache header: 502, 429, invalid, offline) uses the miss gap
+      // so items are not looked up back to back during an outage.
+      if (!(res && res.cache === 'hit')) lastMissAt = Date.now();
+      if (res && res.ok) {
+        busyStrike = 0;
+        if (pauseReason === 'busy' || pauseReason === 'temp') { pauseReason = ''; pausedUntil = 0; }
+        return DvdLookup.lookupMovie(res.title, null).then(function (movie) {
+          var title = (movie && movie.title) || res.title;
+          var year = (movie && movie.year) || '';
+          var dup = findDuplicate(title, year, item.barcode, null);
+          if (dup) {
+            markQueueDuplicate(item, dup, title, year);
+            return putQueueItem(item);
+          }
+          return saveNewMovie({
+            title: title,
+            year: year,
+            barcode: item.barcode,
+            coverBlob: movie && movie.posterBlob,
+            posterUrl: movie && movie.posterUrl,
+            source: (movie && movie.source) || 'lookup',
+            tmdbId: movie && movie.tmdbId
+          }).then(function (rec) {
+            item.status = 'found';
+            item.title = rec.title;
+            item.year = rec.year;
+            item.addedId = rec.id;
+            item.updatedAt = isoNow();
+            return putQueueItem(item);
+          });
+        });
+      }
+      if (res && (res.reason === 'busy' || res.reason === 'upstream_busy')) {
+        applyQueueBackoff('busy');
+        return;
+      }
+      if (res && (res.reason === 'upstream' || res.reason === 'http' || res.reason === 'offline')) {
+        applyQueueBackoff('temp');
+        return;
+      }
+      if (res && res.reason === 'daily_limit') {
+        dailyResetAt = res.resetAt || nextUtcMidnightIso();
+        var ms = Date.parse(dailyResetAt);
+        pausedUntil = isFinite(ms) ? ms : Date.now() + 60 * 60 * 1000;
+        pauseReason = 'daily_limit';
+        return;
+      }
+      busyStrike = 0;
+      if (res && res.reason === 'not_found') {
+        item.status = 'not_found';
+        item.errorReason = 'not_found';
+      } else {
+        // Truly invalid barcodes (and other terminal failures) stay Error.
+        item.status = 'error';
+        item.errorReason = (res && res.reason) || 'http';
+      }
+      item.updatedAt = isoNow();
+      return putQueueItem(item);
+    }).then(function () {
+      queueRunning = false;
+      refreshQueueChrome();
+      kickQueue();
+    }).catch(function () {
+      queueRunning = false;
+      if (item.status === 'waiting') applyQueueBackoff('temp');
+      refreshQueueChrome();
+      kickQueue();
+    });
+  }
+
+  function applyQueueBackoff(reason) {
+    var dly = QUEUE_BUSY[Math.min(busyStrike, QUEUE_BUSY.length - 1)];
+    busyStrike += 1;
+    pausedUntil = Date.now() + dly;
+    pauseReason = reason || 'busy';
+  }
+
+  function markQueueDuplicate(item, owned, foundTitle, foundYear) {
+    var name = (owned && owned.item && owned.item.title) || foundTitle || item.title || '';
+    item.status = 'duplicate';
+    item.title = name;
+    item.year = (owned && owned.item && owned.item.year) || foundYear || item.year || '';
+    item.addedId = owned && owned.item ? owned.item.id : item.addedId;
+    item.ownedLabel = name ? ('Already own: ' + name) : 'Already own this';
+    item.updatedAt = isoNow();
+  }
+
+  function markQueueFound(id, rec) {
+    var item = findQueueItem(id);
+    if (!item) return Promise.resolve();
+    item.status = 'found';
+    item.title = rec && rec.title || item.title;
+    item.year = rec && rec.year || item.year;
+    item.addedId = rec && rec.id || item.addedId;
+    item.updatedAt = isoNow();
+    return putQueueItem(item);
+  }
+
+  function clearFinishedQueue() {
+    var keep = [];
+    var drop = [];
+    queueItems.forEach(function (i) {
+      if (i.status === 'found' || i.status === 'duplicate') drop.push(i.id);
+      else keep.push(i);
+    });
+    queueItems = keep;
+    return tx(['scanQueue'], 'readwrite', function (t) {
+      var store = t.objectStore('scanQueue');
+      drop.forEach(function (id) { store.delete(id); });
+    }).then(function () { refreshQueueChrome(); });
+  }
+
+  function retryQueueItem(id) {
+    var item = findQueueItem(id);
+    if (!item) return;
+    item.status = 'waiting';
+    item.errorReason = '';
+    item.updatedAt = isoNow();
+    return putQueueItem(item).then(function () {
+      refreshQueueChrome();
+      kickQueue();
+    });
+  }
+
+  function removeQueueItem(id) {
+    queueItems = queueItems.filter(function (i) { return i.id !== id; });
+    return deleteQueueItem(id).then(function () { refreshQueueChrome(); });
+  }
+
+  function typeTitleForQueue(id) {
+    var item = findQueueItem(id);
+    if (!item) return;
+    draft = blankDraft({
+      barcode: item.barcode,
+      fromQueueId: item.id,
+      missed: true,
+      missKind: 'not_found',
+      missReason: (window.DvdLookup && DvdLookup.barcodeReasonText) ? DvdLookup.barcodeReasonText('not_found') : ''
+    });
+    show('missed');
+  }
+
   function renderLooking() {
     app.innerHTML =
       '<div class="looking" role="status" aria-live="polite">' +
@@ -488,7 +970,7 @@
   function renderMissed() {
     var d = draft || {};
     app.innerHTML =
-      '<div class="topbar"><button type="button" class="link" data-action="scan">Back</button>' +
+      '<div class="topbar"><button type="button" class="link" data-action="' + (d.fromQueueId ? 'queue' : 'scan') + '">Back</button>' +
       '<h2>Add a title</h2><span class="spacer"></span></div>' +
       '<div class="form">' +
       '<p class="msg">' + (d.missed ? (d.missKind && d.missKind !== 'not_found' ? 'Couldn\'t look it up right now. Type the title and we\'ll add it.' : 'Couldn\'t find it. Type the title and we\'ll add it.') : 'Type the title and we\'ll add it.') + '</p>' +
@@ -710,6 +1192,7 @@
     if (view !== 'looking') show('looking');
     var keptCover = draft && draft.coverBlob;
     var barcode = draft && draft.barcode;
+    var fromQueueId = draft && draft.fromQueueId;
     return DvdLookup.lookupMovie(title, year).then(function (res) {
       if (gen && gen !== lookupGen) return;
       draft = blankDraft({
@@ -719,7 +1202,8 @@
         coverBlob: keptCover || (res && res.posterBlob) || null,
         posterUrl: res && res.posterUrl,
         source: (res && res.source) || 'manual',
-        tmdbId: res && res.tmdbId
+        tmdbId: res && res.tmdbId,
+        fromQueueId: fromQueueId || null
       });
       show('found');
     });
@@ -742,24 +1226,42 @@
       show('found');
       return;
     }
-    var rec = {
-      id: newId(),
+    var fromQueueId = draft.fromQueueId;
+    return saveNewMovie({
       title: draft.title,
       year: draft.year || '',
       barcode: draft.barcode || '',
-      addedAt: isoNow(),
-      hasCover: !!draft.coverBlob,
+      coverBlob: draft.coverBlob,
       source: draft.source || 'manual',
       tmdbId: draft.tmdbId || null,
       posterUrl: draft.posterUrl || null
-    };
-    return saveDvd(rec, draft.coverBlob, !!draft.coverBlob).then(function () {
-      dvds.push(rec);
-      sortDvds();
+    }).then(function (rec) {
       currentId = rec.id;
       toast('Added to your collection');
-      scheduleBackup();
+      if (fromQueueId) {
+        return markQueueFound(fromQueueId, rec).then(function () { show('queue'); });
+      }
       show('home');
+    });
+  }
+
+  function saveNewMovie(fields) {
+    var rec = {
+      id: newId(),
+      title: fields.title,
+      year: fields.year || '',
+      barcode: fields.barcode || '',
+      addedAt: isoNow(),
+      hasCover: !!fields.coverBlob,
+      source: fields.source || 'manual',
+      tmdbId: fields.tmdbId || null,
+      posterUrl: fields.posterUrl || null
+    };
+    return saveDvd(rec, fields.coverBlob, !!fields.coverBlob).then(function () {
+      dvds.push(rec);
+      sortDvds();
+      scheduleBackup();
+      return rec;
     });
   }
 
@@ -1417,6 +1919,12 @@
     if (action === 'home') return show('home');
     if (action === 'settings') return show('settings');
     if (action === 'scan') { scanError = ''; draft = null; return show('scan'); }
+    if (action === 'batch-scan') { scanError = ''; batchStatus = ''; unlockAudio(); return show('batch-scan'); }
+    if (action === 'queue') return show('queue');
+    if (action === 'clear-finished') return clearFinishedQueue();
+    if (action === 'queue-retry') return retryQueueItem(id);
+    if (action === 'queue-remove') return removeQueueItem(id);
+    if (action === 'queue-type-title') return typeTitleForQueue(id);
     if (action === 'clear-search') { query = ''; var s = document.getElementById('search'); if (s) s.value = ''; return renderResults(); }
     if (action === 'open') { currentId = id; return show('detail'); }
     if (action === 'type-title') {
@@ -1537,7 +2045,8 @@
       getSetting('githubOwner'),
       getSetting('githubRepo'),
       getSetting('backupPending'),
-      getSetting('lastRestoreAt')
+      getSetting('lastRestoreAt'),
+      getAllQueue().catch(function () { return []; })
     ]).then(function (got) {
       dvds = got[0] || [];
       sortDvds();
@@ -1547,7 +2056,9 @@
       githubRepo = got[4] || DEFAULT_REPO;
       backupPending = !!got[5];
       lastRestoreAt = got[6] || null;
+      queueItems = got[7] || [];
       show('home');
+      kickQueue();
       if (backupPending && githubToken) runBackup({ auto: true });
     }).catch(function () {
       dvds = [];
@@ -1558,6 +2069,10 @@
   boot();
   window.addEventListener('online', function () {
     if (backupPending && githubToken) runBackup({ auto: true });
+    resumeQueue('online');
+  });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) resumeQueue('visible');
   });
 
   if ('serviceWorker' in navigator) {
@@ -1573,6 +2088,32 @@
     matches: matches,
     matchQuality: matchQuality,
     simulateBarcode: function (code) { return onBarcode(code, true); },
+    enqueueBarcode: function (code) { return enqueueBarcode(code, { fromTest: true }); },
+    setQueueTiming: function (opts) {
+      if (!opts) return;
+      if (opts.missGap != null) QUEUE_MISS_GAP = Number(opts.missGap);
+      if (opts.busyBackoffs) QUEUE_BUSY = opts.busyBackoffs.slice();
+    },
+    pauseQueue: function () { queuePaused = true; if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; } },
+    resumeQueue: function () { resumeQueue('test'); },
+    getQueue: function () { return queueItems.map(function (i) { return Object.assign({}, i); }); },
+    removeQueueItem: function (id) { return removeQueueItem(id); },
+    clearFinishedQueue: function () { return clearFinishedQueue(); },
+    dbClosedByVersionChange: function () { return dbClosedByVersionChange; },
+    getQueueState: function () {
+      return {
+        pauseReason: pauseReason,
+        pausedUntil: pausedUntil,
+        dailyResetAt: dailyResetAt,
+        lastMissAt: lastMissAt,
+        busyStrike: busyStrike,
+        running: queueRunning,
+        paused: queuePaused,
+        missGap: QUEUE_MISS_GAP,
+        busyBackoffs: QUEUE_BUSY.slice(),
+        waiting: queueCounts().waiting
+      };
+    },
     buildBackupPayload: buildBackupPayload,
     runBackup: function () { return runBackup({ auto: false }); },
     scheduleBackup: scheduleBackup,
