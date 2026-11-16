@@ -1,8 +1,9 @@
 /* My DVDs ("Do I own it?") — the app itself.
    Screens: Home (search + cover grid), Scan, Missed (type the title),
    Found (add / already own), Detail, Edit, Settings.
-   The list and covers live in this phone's IndexedDB. A GitHub token, when
-   pasted later, is also stored only here — never in the public site. */
+   The list and covers live in this phone's IndexedDB. A GitHub key, when
+   pasted in Settings, is also stored only here — never in the public site
+   or in a backup file. */
 (function () {
   'use strict';
 
@@ -78,8 +79,9 @@
   }
 
   // ---------- Storage (IndexedDB, on this phone only) ----------
-  // dvds: the list. covers: JPEG blobs. settings: githubToken, lastBackupAt
-  // (a token would live only in this settings store, never in the public site).
+  // dvds: the list. covers: JPEG blobs. settings: githubToken, githubOwner,
+  // githubRepo, lastBackupAt, lastRestoreAt, backupPending (the key lives only
+  // in this settings store, never in the public site or a backup file).
   var dbPromise = null;
   function db() {
     if (!dbPromise) {
@@ -145,8 +147,23 @@
   var draft = null;       // found / edit / type-title
   var scanError = '';
   var lastBackupAt = null;
+  var lastRestoreAt = null;
   var githubToken = '';   // kept only in memory + IndexedDB, never exported
+  var githubOwner = 'williamsdan94';
+  var githubRepo = 'dvd-backup';
+  var backupPending = false;
+  var backupStatus = '';
+  var backupBusy = false;
+  var changedDuringUpload = false;
+  var failNextReplace = false;
+  var backupTimer = null;
+  var restorePreview = null;
+  var ghHelpOpen = false;
+  var tokenDraft = '';
   var objectUrls = [];
+  var DEFAULT_OWNER = 'williamsdan94';
+  var DEFAULT_REPO = 'dvd-backup';
+  var GH_API = 'https://api.github.com';
 
   function sortDvds() {
     dvds.sort(function (a, b) {
@@ -329,10 +346,23 @@
     if (view === 'detail') return renderDetail();
     if (view === 'edit') return renderEdit();
     if (view === 'settings') return renderSettings();
+    if (view === 'restore') return renderRestore();
   }
 
+  function niceDateTime(iso) {
+    var d = new Date(iso);
+    if (isNaN(d.getTime())) return niceDate(iso) || '';
+    var mins = ('0' + d.getMinutes()).slice(-2);
+    var hours = d.getHours();
+    var ampm = hours >= 12 ? 'PM' : 'AM';
+    var h12 = hours % 12 || 12;
+    return MONTHS[d.getMonth()] + ' ' + d.getDate() + ', ' + d.getFullYear() + ', ' + h12 + ':' + mins + ' ' + ampm;
+  }
   function backupLabel() {
-    return lastBackupAt ? ('Last backed up: ' + niceDate(lastBackupAt)) : 'Last backed up: never';
+    return lastBackupAt ? ('Last backup: ' + niceDateTime(lastBackupAt)) : 'Last backup: never';
+  }
+  function statusLine() {
+    return backupStatus || backupLabel();
   }
 
   function renderHome() {
@@ -572,6 +602,16 @@
     if (window.DvdLookup && DvdLookup.TMDB_ENABLED) {
       tmdbLine = '<p class="tmdb-credit">This product uses the TMDB API but is not endorsed or certified by TMDB.</p>';
     }
+    var keyHint = githubToken ? 'Key saved on this phone. Paste a new one to replace it.' : 'Paste your key';
+    var help = ghHelpOpen
+      ? ('<ol class="gh-steps">' +
+        '<li>On GitHub, open Settings, then Developer settings, then Fine-grained tokens, then Generate.</li>' +
+        '<li>Under Repository access, choose Only select repositories and pick <strong>dvd-backup</strong>.</li>' +
+        '<li>Under Repository permissions, set Contents to Read and write.</li>' +
+        '<li>Set expiration to 1 year, then generate the key and copy it (GitHub only shows it once).</li>' +
+        '<li>Paste the key here and tap Save.</li>' +
+        '</ol>')
+      : '';
     app.innerHTML =
       '<div class="topbar"><button type="button" class="link" data-action="home">Back</button>' +
       '<h2>Settings</h2><span class="spacer"></span></div>' +
@@ -583,16 +623,47 @@
       '<p class="note-line">Import adds titles you don\'t already have (matched by barcode or title) and leaves the ones already on this phone alone.</p>' +
       '<div class="gh-backup">' +
       '<h3>Back up to GitHub</h3>' +
-      '<p class="soon">Coming soon. This will save your list to a private GitHub repository. The token stays only on this phone, never in the public site.</p>' +
-      '<div class="field"><label for="github-token">GitHub token</label>' +
-      '<input id="github-token" class="inp" type="password" autocomplete="off" spellcheck="false" placeholder="Paste token later" value="' + esc(githubToken || '') + '"></div>' +
-      '<button type="button" class="btn-big" data-action="github-backup" disabled>Back up to GitHub</button>' +
+      '<p class="note-line">Saves your list (not cover photos) to your private dvd-backup folder. Cover art is looked up again from the saved picture link. The key stays only on this phone, never in the public site.</p>' +
+      '<button type="button" class="edit-link" data-action="toggle-gh-help">' + (ghHelpOpen ? 'Hide key steps' : 'How to make a key') + '</button>' +
+      help +
+      '<div class="field"><label for="gh-owner">Owner</label>' +
+      '<input id="gh-owner" class="inp" type="text" autocomplete="off" spellcheck="false" value="' + esc(githubOwner || DEFAULT_OWNER) + '"></div>' +
+      '<div class="field"><label for="gh-repo">Repository</label>' +
+      '<input id="gh-repo" class="inp" type="text" autocomplete="off" spellcheck="false" value="' + esc(githubRepo || DEFAULT_REPO) + '"></div>' +
+      '<div class="field"><label for="github-token">GitHub key</label>' +
+      '<input id="github-token" class="inp" type="password" autocomplete="off" spellcheck="false" placeholder="' + esc(keyHint) + '" value="' + esc(tokenDraft) + '"></div>' +
+      '<button type="button" class="btn-big" data-action="save-github">Save</button>' +
+      '<button type="button" class="btn-small" data-action="github-backup">Back up now</button>' +
+      '<button type="button" class="btn-small" data-action="github-restore">Restore from GitHub</button>' +
+      '<button type="button" class="btn-small" data-action="forget-github">Forget key</button>' +
+      '<p class="note-line' + (backupStatus ? ' gh-status-err' : '') + '" id="gh-status">' + esc(statusLine()) + '</p>' +
       '</div>' +
       '<div class="about">' +
       '<p>My DVDs keeps your list on this phone. Cover art and year may be looked up on Wikipedia.</p>' +
       tmdbLine +
       '</div></div>';
   }
+
+  function renderRestore() {
+    var movies = (restorePreview && restorePreview.movies) || [];
+    var valid = !!(restorePreview && restorePreview.valid !== false);
+    var n = movies.length;
+    var canReplace = valid && n > 0;
+    app.innerHTML =
+      '<div class="topbar"><button type="button" class="link" data-action="settings">Back</button>' +
+      '<h2>Restore</h2><span class="spacer"></span></div>' +
+      '<div class="form">' +
+      '<p class="msg">This backup has ' + n + ' movie' + (n === 1 ? '' : 's') + '.</p>' +
+      '<p class="note-line">Merge keeps the movies already on this phone and adds any missing ones.' +
+      (canReplace ? ' Replace uses the backup as the full list (movies only on this phone would be removed).' : '') +
+      '</p>' +
+      '</div>' +
+      '<div class="footer"><div>' +
+      '<button type="button" class="btn-big" data-action="restore-merge">Merge</button>' +
+      (canReplace ? '<button type="button" class="btn-small" data-action="restore-replace">Replace</button>' : '') +
+      '</div></div>';
+  }
+
 
   // ---------- Actions ----------
   function blankDraft(extra) {
@@ -679,13 +750,15 @@
       addedAt: isoNow(),
       hasCover: !!draft.coverBlob,
       source: draft.source || 'manual',
-      tmdbId: draft.tmdbId || null
+      tmdbId: draft.tmdbId || null,
+      posterUrl: draft.posterUrl || null
     };
     return saveDvd(rec, draft.coverBlob, !!draft.coverBlob).then(function () {
       dvds.push(rec);
       sortDvds();
       currentId = rec.id;
       toast('Added to your collection');
+      scheduleBackup();
       show('home');
     });
   }
@@ -712,6 +785,7 @@
     return saveDvd(rec, draft.coverBlob, false).then(function () {
       currentId = rec.id;
       toast('Saved');
+      scheduleBackup();
       show('detail');
     });
   }
@@ -723,6 +797,7 @@
     deleteDvd(r.id).then(function () {
       dvds = dvds.filter(function (x) { return x.id !== r.id; });
       toast('Deleted');
+      scheduleBackup();
       show('home');
     });
   }
@@ -742,7 +817,7 @@
   function exportJson() {
     var payload = { app: 'my-dvds', exportedAt: isoNow(), dvds: [] };
     var jobs = dvds.map(function (d) {
-      var row = { id: d.id, title: d.title, year: d.year || '', barcode: d.barcode || '', addedAt: d.addedAt, source: d.source || '', tmdbId: d.tmdbId || null, cover: null };
+      var row = { id: d.id, title: d.title, year: d.year || '', barcode: d.barcode || '', addedAt: d.addedAt, source: d.source || '', tmdbId: d.tmdbId || null, posterUrl: d.posterUrl || null, cover: null };
       if (!d.hasCover) {
         payload.dvds.push(row);
         return Promise.resolve();
@@ -794,10 +869,14 @@
             addedAt: row.addedAt || isoNow(),
             hasCover: false,
             source: row.source || 'import',
-            tmdbId: row.tmdbId || null
+            tmdbId: row.tmdbId || null,
+            posterUrl: row.posterUrl || null
           };
           var coverP = Promise.resolve(null);
           if (row.cover && /^data:/i.test(row.cover)) coverP = dataUrlToBlob(row.cover);
+          else if (row.posterUrl && window.DvdLookup && DvdLookup.downloadPoster) {
+            coverP = DvdLookup.downloadPoster(row.posterUrl);
+          }
           return coverP.then(function (blob) {
             rec.hasCover = !!blob;
             return saveDvd(rec, blob, !!blob).then(function () {
@@ -810,10 +889,522 @@
       return chain.then(function () {
         sortDvds();
         toast('Imported ' + added + (skipped ? (', skipped ' + skipped + ' already owned') : ''));
+        if (added) scheduleBackup();
         show('settings');
       });
     }).catch(function () {
       toast('That file could not be read.');
+    });
+  }
+
+  // ---------- GitHub backup (browser -> api.github.com, key only in Authorization) ----------
+  function tokenLooksValid(t) {
+    return /^(github_pat_|ghp_)[A-Za-z0-9_]+$/.test(String(t || '').trim());
+  }
+  function repoPathOk(s) {
+    return /^[A-Za-z0-9_.-]+$/.test(String(s || ''));
+  }
+  function contentsUrl(owner, repo) {
+    return GH_API + '/repos/' + encodeURIComponent(owner) + '/' + encodeURIComponent(repo) + '/contents/dvds.json';
+  }
+  function utf8ToBase64(str) {
+    var bytes = new TextEncoder().encode(str);
+    var chunk = 0x8000, bin = '', i;
+    for (i = 0; i < bytes.length; i += chunk) {
+      bin += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+    }
+    return btoa(bin);
+  }
+  function base64ToUtf8(b64) {
+    var clean = String(b64 || '').replace(/\s+/g, '');
+    var bin = atob(clean);
+    var bytes = new Uint8Array(bin.length), i;
+    for (i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder().decode(bytes);
+  }
+  function isRateLimited(res) {
+    if (!res) return false;
+    if (res.status === 429) return true;
+    if (res.status === 403) {
+      var left = res.headers && res.headers.get && res.headers.get('x-ratelimit-remaining');
+      if (left === '0') return true;
+    }
+    return false;
+  }
+  function githubErrorText(status, kind) {
+    if (kind === 'offline') return "You're offline. Connect and try again.";
+    if (kind === 'pending-offline') return "You're offline. We'll back up when you're back online.";
+    if (kind === 'no-key') return 'Paste your key and tap Save first.';
+    if (kind === 'bad-key') return 'That doesn\'t look like a GitHub key. It should start with github_pat_ or ghp_.';
+    if (kind === 'bad-repo') return 'Check the owner and repository names.';
+    if (status === 401) return 'Key expired or wrong, make a new one';
+    if (kind === 'rate') return 'GitHub is asking us to wait. Try again in a few minutes.';
+    if (status === 403 || status === 404) return "Key can't see the dvd-backup folder, check it's selected";
+    return "Couldn't reach GitHub. Try again in a minute.";
+  }
+  function githubFetch(url, opts) {
+    if (String(url).indexOf(GH_API + '/') !== 0) {
+      return Promise.reject(new Error('bad-url'));
+    }
+    var headers = {
+      'Accept': 'application/vnd.github+json',
+      'Authorization': 'Bearer ' + githubToken
+    };
+    if (opts && opts.json) headers['Content-Type'] = 'application/json';
+    return fetch(url, {
+      method: (opts && opts.method) || 'GET',
+      headers: headers,
+      body: opts && opts.body ? opts.body : undefined
+    });
+  }
+  function buildBackupPayload() {
+    return {
+      app: 'my-dvds',
+      exportedAt: isoNow(),
+      dvds: dvds.map(function (d) {
+        return {
+          id: d.id,
+          title: d.title,
+          year: d.year || '',
+          barcode: d.barcode || '',
+          addedAt: d.addedAt,
+          source: d.source || '',
+          tmdbId: d.tmdbId || null,
+          posterUrl: d.posterUrl || null
+        };
+      })
+    };
+  }
+  function setStatusAndRefresh(text) {
+    backupStatus = text || '';
+    var el = document.getElementById('gh-status');
+    if (el) {
+      el.textContent = statusLine();
+      if (backupStatus) el.classList.add('gh-status-err');
+      else el.classList.remove('gh-status-err');
+    }
+    var meta = document.getElementById('backup-meta');
+    if (meta) meta.textContent = backupLabel();
+  }
+  function markPending(yes) {
+    backupPending = !!yes;
+    return setSetting('backupPending', backupPending).catch(function () {});
+  }
+  function scheduleBackup() {
+    if (!githubToken) return;
+    markPending(true);
+    if (backupBusy) {
+      changedDuringUpload = true;
+      return;
+    }
+    clearTimeout(backupTimer);
+    backupTimer = setTimeout(function () {
+      runBackup({ auto: true });
+    }, 5000);
+  }
+  function getRemoteBackup() {
+    return githubFetch(contentsUrl(githubOwner, githubRepo)).then(function (res) {
+      if (res.status === 404) return { missing: true, res: res };
+      if (!res.ok) return { error: true, res: res };
+      return res.json().then(function (data) {
+        try {
+          var parsed = JSON.parse(base64ToUtf8(data.content || ''));
+          var movies = Array.isArray(parsed) ? parsed : (parsed && Array.isArray(parsed.dvds) ? parsed.dvds : null);
+          if (!movies) return { invalid: true, sha: data.sha, res: res };
+          return { sha: data.sha, payload: parsed, movies: movies, res: res };
+        } catch (e) {
+          return { invalid: true, sha: data && data.sha, res: res };
+        }
+      });
+    });
+  }
+  function putRemoteBackup(payload, sha) {
+    var body = {
+      message: 'Backup: ' + payload.dvds.length + ' movie' + (payload.dvds.length === 1 ? '' : 's'),
+      content: utf8ToBase64(JSON.stringify(payload, null, 2))
+    };
+    if (sha) body.sha = sha;
+    return githubFetch(contentsUrl(githubOwner, githubRepo), {
+      method: 'PUT',
+      json: true,
+      body: JSON.stringify(body)
+    });
+  }
+  function failFromRes(res) {
+    return { status: res && res.status, kind: isRateLimited(res) ? 'rate' : '' };
+  }
+  function isVirginDevice() {
+    return !lastBackupAt && !lastRestoreAt;
+  }
+  function wouldShrinkRemote(localN, remoteN) {
+    if (remoteN == null || remoteN < 0) return false;
+    if (remoteN > 0 && localN === 0) return true;
+    return (remoteN - localN) > 3;
+  }
+  function restoreFirstMessage(n) {
+    return 'Your backup on GitHub has ' + n + ' movie' + (n === 1 ? '' : 's') + '. Tap Restore, then Merge, first.';
+  }
+  function shrinkAutoMessage(localN, remoteN) {
+    return 'This phone has ' + localN + ' movie' + (localN === 1 ? '' : 's') + ', but GitHub has ' + remoteN + '. Tap Back up now if you want to replace the backup.';
+  }
+  function putWithRetry(payload, sha) {
+    return putRemoteBackup(payload, sha).then(function (res) {
+      if (res.status === 409 || res.status === 422) {
+        return getRemoteBackup().then(function (again) {
+          if (again.error) throw failFromRes(again.res);
+          if (again.missing) throw { status: 422 };
+          return putRemoteBackup(payload, again.sha).then(function (res2) {
+            if (!res2.ok) throw failFromRes(res2);
+            return res2;
+          });
+        });
+      }
+      if (!res.ok) throw failFromRes(res);
+      return res;
+    });
+  }
+  function finishBusy(keepPending) {
+    backupBusy = false;
+    var needsAgain = changedDuringUpload;
+    changedDuringUpload = false;
+    if (needsAgain) keepPending = true;
+    var p = markPending(!!keepPending);
+    if (needsAgain) scheduleBackup();
+    return p;
+  }
+  function runBackup(opts) {
+    opts = opts || {};
+    if (backupBusy) {
+      markPending(true);
+      changedDuringUpload = true;
+      return Promise.resolve();
+    }
+    if (!githubToken) {
+      if (!opts.auto) setStatusAndRefresh(githubErrorText(0, 'no-key'));
+      return Promise.resolve();
+    }
+    if (!tokenLooksValid(githubToken)) {
+      if (!opts.auto) setStatusAndRefresh(githubErrorText(0, 'bad-key'));
+      return Promise.resolve();
+    }
+    if (!repoPathOk(githubOwner) || !repoPathOk(githubRepo)) {
+      if (!opts.auto) setStatusAndRefresh(githubErrorText(0, 'bad-repo'));
+      return Promise.resolve();
+    }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      markPending(true);
+      setStatusAndRefresh(githubErrorText(0, opts.auto ? 'pending-offline' : 'offline'));
+      return Promise.resolve();
+    }
+    backupBusy = true;
+    changedDuringUpload = false;
+    if (!opts.auto) setStatusAndRefresh('');
+    var payload = buildBackupPayload();
+    var localN = payload.dvds.length;
+    return getRemoteBackup().then(function (got) {
+      if (got.error) throw failFromRes(got.res);
+      var remoteN = got.missing ? 0 : (got.invalid ? null : (got.movies || []).length);
+      if (!got.missing && !got.invalid && isVirginDevice() && remoteN > 0) {
+        var freshMsg = restoreFirstMessage(remoteN);
+        return finishBusy(false).then(function () {
+          setStatusAndRefresh(freshMsg);
+          toast(freshMsg);
+        });
+      }
+      if (opts.auto && wouldShrinkRemote(localN, remoteN)) {
+        return finishBusy(false).then(function () {
+          setStatusAndRefresh(shrinkAutoMessage(localN, remoteN));
+        });
+      }
+      if (!opts.auto && wouldShrinkRemote(localN, remoteN)) {
+        backupBusy = false;
+        var ok = window.confirm('GitHub has ' + remoteN + ' movies, this phone has ' + localN + '. Replace the backup with ' + localN + '?');
+        if (!ok) {
+          return finishBusy(false).then(function () {
+            setStatusAndRefresh('Backup cancelled. Your GitHub backup was left as it was.');
+          });
+        }
+        backupBusy = true;
+      }
+      var sha = got.missing ? null : got.sha;
+      return putWithRetry(payload, sha);
+    }).then(function (res) {
+      if (!res) return;
+      lastBackupAt = isoNow();
+      backupStatus = '';
+      return Promise.all([
+        setSetting('lastBackupAt', lastBackupAt),
+        finishBusy(false)
+      ]).then(function () {
+        setStatusAndRefresh('');
+        if (view === 'settings') renderSettings();
+        if (!opts.auto) toast('Backup saved');
+      });
+    }).catch(function (err) {
+      var noStatus = !err || !err.status;
+      var kind = (err && err.kind) || '';
+      var keep = false;
+      if (noStatus || kind === 'offline') {
+        keep = true;
+        kind = opts.auto ? 'pending-offline' : 'offline';
+      }
+      var msg = githubErrorText(err && err.status, kind);
+      return finishBusy(keep).then(function () {
+        setStatusAndRefresh(msg);
+        if (!opts.auto) toast(msg);
+      });
+    });
+  }
+  function readGithubFields() {
+    var o = document.getElementById('gh-owner');
+    var r = document.getElementById('gh-repo');
+    var t = document.getElementById('github-token');
+    if (o && o.value.trim()) githubOwner = o.value.trim();
+    if (r && r.value.trim()) githubRepo = r.value.trim();
+    if (t) tokenDraft = t.value;
+    if (t && t.value.trim()) return t.value.trim();
+    return null;
+  }
+  function saveGithubSettings() {
+    var typed = readGithubFields();
+    if (!repoPathOk(githubOwner) || !repoPathOk(githubRepo)) {
+      setStatusAndRefresh(githubErrorText(0, 'bad-repo'));
+      return;
+    }
+    if (typed !== null) {
+      if (!tokenLooksValid(typed)) {
+        setStatusAndRefresh(githubErrorText(0, 'bad-key'));
+        return;
+      }
+      githubToken = typed;
+      tokenDraft = '';
+    }
+    if (!githubToken) {
+      setStatusAndRefresh(githubErrorText(0, 'no-key'));
+      return;
+    }
+    Promise.all([
+      setSetting('githubToken', githubToken),
+      setSetting('githubOwner', githubOwner),
+      setSetting('githubRepo', githubRepo)
+    ]).then(function () {
+      backupStatus = '';
+      toast('Key saved on this phone');
+      renderSettings();
+    });
+  }
+  function forgetGithubKey() {
+    githubToken = '';
+    tokenDraft = '';
+    backupPending = false;
+    backupStatus = '';
+    changedDuringUpload = false;
+    clearTimeout(backupTimer);
+    Promise.all([
+      setSetting('githubToken', ''),
+      setSetting('backupPending', false)
+    ]).then(function () {
+      toast('Key forgotten on this phone');
+      renderSettings();
+    });
+  }
+  function startRestore() {
+    readGithubFields();
+    if (!githubToken) {
+      setStatusAndRefresh(githubErrorText(0, 'no-key'));
+      return;
+    }
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) {
+      setStatusAndRefresh(githubErrorText(0, 'offline'));
+      return;
+    }
+    setStatusAndRefresh('');
+    getRemoteBackup().then(function (got) {
+      if (got.missing) throw { status: 404 };
+      if (got.error) throw failFromRes(got.res);
+      if (got.invalid) {
+        var invalidMsg = "This backup file doesn't look valid.";
+        setStatusAndRefresh(invalidMsg);
+        toast(invalidMsg);
+        return;
+      }
+      restorePreview = { movies: got.movies || [], sha: got.sha, valid: true };
+      show('restore');
+    }).catch(function (err) {
+      var kind = (err && err.kind) || (!err || !err.status ? 'offline' : '');
+      var msg = githubErrorText(err && err.status, kind);
+      setStatusAndRefresh(msg);
+      toast(msg);
+    });
+  }
+  function findLocalForRestore(row) {
+    if (row && row.id) {
+      var byId = dvds.filter(function (d) { return d.id === row.id; })[0];
+      if (byId) return byId;
+    }
+    var nb = normalizeBarcode(row && row.barcode);
+    if (!nb) return null;
+    return dvds.filter(function (d) { return normalizeBarcode(d.barcode) === nb; })[0] || null;
+  }
+  function coverForRow(row, rec, keepLocalCover) {
+    if (keepLocalCover) {
+      return getCover(rec.id).then(function (blob) {
+        if (blob) {
+          rec.hasCover = true;
+          return { rec: rec, blob: blob, coverChanged: false };
+        }
+        return fetchRestoreCover(row, rec);
+      });
+    }
+    return fetchRestoreCover(row, rec);
+  }
+  function fetchRestoreCover(row, rec) {
+    if (row && row.cover && /^data:/i.test(row.cover)) {
+      return dataUrlToBlob(row.cover).then(function (blob) {
+        rec.hasCover = !!blob;
+        return { rec: rec, blob: blob, coverChanged: !!blob };
+      });
+    }
+    if (row && row.posterUrl && window.DvdLookup && DvdLookup.downloadPoster) {
+      return DvdLookup.downloadPoster(row.posterUrl).then(function (blob) {
+        rec.hasCover = !!blob;
+        return { rec: rec, blob: blob, coverChanged: !!blob };
+      });
+    }
+    return Promise.resolve({ rec: rec, blob: null, coverChanged: false });
+  }
+  function buildRestoreRec(row, usedIds) {
+    if (!row || !String(row.title || '').trim()) return null;
+    var id;
+    if (row.id && !usedIds[row.id]) id = String(row.id);
+    else id = newId();
+    usedIds[id] = true;
+    return {
+      id: id,
+      title: String(row.title).trim(),
+      year: row.year ? String(row.year) : '',
+      barcode: row.barcode ? String(row.barcode) : '',
+      addedAt: row.addedAt || isoNow(),
+      hasCover: false,
+      source: row.source || 'restore',
+      tmdbId: row.tmdbId || null,
+      posterUrl: row.posterUrl || null
+    };
+  }
+  function prepareRestoreRows(movies) {
+    var usedIds = {};
+    var recs = [];
+    var i, rec;
+    for (i = 0; i < movies.length; i++) {
+      rec = buildRestoreRec(movies[i], usedIds);
+      if (!rec) return Promise.reject(new Error('invalid-record'));
+      recs.push({ row: movies[i], rec: rec });
+    }
+    return Promise.all(recs.map(function (item) {
+      return fetchRestoreCover(item.row, item.rec).then(function (got) {
+        got.rec.hasCover = !!got.blob;
+        return { rec: got.rec, blob: got.blob || null };
+      });
+    }));
+  }
+  function replaceAllDvds(rows) {
+    return db().then(function (d) {
+      return new Promise(function (resolve, reject) {
+        var t = d.transaction(['dvds', 'covers'], 'readwrite');
+        var dvdStore = t.objectStore('dvds');
+        var coverStore = t.objectStore('covers');
+        var settled = false;
+        t.oncomplete = function () { if (!settled) { settled = true; resolve(); } };
+        t.onerror = t.onabort = function () {
+          if (!settled) { settled = true; reject(t.error || new Error('replace-aborted')); }
+        };
+        dvdStore.clear();
+        coverStore.clear();
+        rows.forEach(function (row) {
+          dvdStore.put(row.rec);
+          if (row.blob) coverStore.put({ id: row.rec.id, blob: row.blob });
+        });
+        if (failNextReplace) {
+          failNextReplace = false;
+          try { t.abort(); } catch (e) {}
+        }
+      });
+    });
+  }
+  function markRestored() {
+    lastRestoreAt = isoNow();
+    return setSetting('lastRestoreAt', lastRestoreAt).catch(function () {});
+  }
+  function applyRestore(mode) {
+    var movies = (restorePreview && restorePreview.movies) || [];
+    var valid = !!(restorePreview && restorePreview.valid !== false);
+    if (mode === 'replace') {
+      if (!valid || !movies.length) {
+        toast("That backup couldn't be used. Your list on this phone was not changed.");
+        return;
+      }
+      var x = dvds.length;
+      var n = movies.length;
+      if (!window.confirm('Remove all ' + x + ' movies on this phone and use the ' + n + ' from the backup?')) {
+        return;
+      }
+      return prepareRestoreRows(movies).then(function (rows) {
+        return replaceAllDvds(rows).then(function () {
+          dvds = rows.map(function (r) { return r.rec; });
+          sortDvds();
+          restorePreview = null;
+          return markRestored().then(function () {
+            toast('Replaced from backup');
+            show('home');
+          });
+        });
+      }).catch(function (err) {
+        var msg = (err && err.message === 'invalid-record')
+          ? "That backup couldn't be used. Your list on this phone was not changed."
+          : "Replace didn't finish. Your list on this phone was left as it was.";
+        toast(msg);
+        backupStatus = msg;
+        show('settings');
+      });
+    }
+    // Merge: never deletes local items. Apply one-by-one; a mid-way
+    // failure leaves everything already on this phone in place.
+    var chain = Promise.resolve();
+    movies.forEach(function (row) {
+      chain = chain.then(function () {
+        if (!row || !String(row.title || '').trim()) return;
+        var existing = findLocalForRestore(row);
+        if (existing) {
+          existing.title = existing.title || String(row.title);
+          existing.year = existing.year || (row.year ? String(row.year) : '');
+          existing.barcode = existing.barcode || (row.barcode ? String(row.barcode) : '');
+          existing.posterUrl = existing.posterUrl || row.posterUrl || null;
+          existing.tmdbId = existing.tmdbId || row.tmdbId || null;
+          return coverForRow(row, existing, true).then(function (got) {
+            return saveDvd(got.rec, got.blob, got.coverChanged);
+          });
+        }
+        var used = {};
+        dvds.forEach(function (d) { used[d.id] = true; });
+        var rec = buildRestoreRec(row, used);
+        if (!rec) return;
+        return coverForRow(row, rec, false).then(function (got) {
+          return saveDvd(got.rec, got.blob, got.coverChanged).then(function () {
+            dvds.push(got.rec);
+          });
+        });
+      });
+    });
+    return chain.then(function () {
+      sortDvds();
+      restorePreview = null;
+      return markRestored().then(function () {
+        toast('Merged from backup');
+        show('home');
+      });
+    }).catch(function () {
+      toast("Merge didn't finish. Movies already on this phone were kept.");
+      show('settings');
     });
   }
 
@@ -861,7 +1452,7 @@
       if (!r) return;
       draft = blankDraft({
         id: r.id, title: r.title, year: r.year, barcode: r.barcode, addedAt: r.addedAt,
-        source: r.source, tmdbId: r.tmdbId
+        source: r.source, tmdbId: r.tmdbId, posterUrl: r.posterUrl
       });
       if (r.hasCover) {
         return getCover(r.id).then(function (blob) { draft.coverBlob = blob; show('edit'); });
@@ -877,7 +1468,20 @@
     if (action === 'detail') { if (draft && draft.id) currentId = draft.id; return show('detail'); }
     if (action === 'export-json') return exportJson();
     if (action === 'import-json') { importInput.click(); return; }
-    if (action === 'github-backup') return; // disabled placeholder; no GitHub calls
+    if (action === 'toggle-gh-help') {
+      readGithubFields();
+      ghHelpOpen = !ghHelpOpen;
+      return renderSettings();
+    }
+    if (action === 'save-github') return saveGithubSettings();
+    if (action === 'github-backup') {
+      readGithubFields();
+      return runBackup({ auto: false });
+    }
+    if (action === 'github-restore') return startRestore();
+    if (action === 'forget-github') return forgetGithubKey();
+    if (action === 'restore-merge') return applyRestore('merge');
+    if (action === 'restore-replace') return applyRestore('replace');
   });
 
   app.addEventListener('input', function (e) {
@@ -888,9 +1492,7 @@
       renderResults();
     }
     if (e.target && e.target.id === 'github-token') {
-      githubToken = e.target.value;
-      // Persist on this phone only. Never written to the public site or the JSON export.
-      setSetting('githubToken', githubToken).catch(function () {});
+      tokenDraft = e.target.value;
     }
   });
 
@@ -928,12 +1530,25 @@
 
   // ---------- Boot ----------
   function boot() {
-    Promise.all([getAllDvds(), getSetting('lastBackupAt'), getSetting('githubToken')]).then(function (got) {
+    Promise.all([
+      getAllDvds(),
+      getSetting('lastBackupAt'),
+      getSetting('githubToken'),
+      getSetting('githubOwner'),
+      getSetting('githubRepo'),
+      getSetting('backupPending'),
+      getSetting('lastRestoreAt')
+    ]).then(function (got) {
       dvds = got[0] || [];
       sortDvds();
       lastBackupAt = got[1] || null;
       githubToken = got[2] || '';
+      githubOwner = got[3] || DEFAULT_OWNER;
+      githubRepo = got[4] || DEFAULT_REPO;
+      backupPending = !!got[5];
+      lastRestoreAt = got[6] || null;
       show('home');
+      if (backupPending && githubToken) runBackup({ auto: true });
     }).catch(function () {
       dvds = [];
       show('home');
@@ -941,6 +1556,9 @@
     if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(function () {});
   }
   boot();
+  window.addEventListener('online', function () {
+    if (backupPending && githubToken) runBackup({ auto: true });
+  });
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', function () { navigator.serviceWorker.register('sw.js').catch(function () {}); });
@@ -954,6 +1572,25 @@
     findDuplicate: findDuplicate,
     matches: matches,
     matchQuality: matchQuality,
-    simulateBarcode: function (code) { return onBarcode(code, true); }
+    simulateBarcode: function (code) { return onBarcode(code, true); },
+    buildBackupPayload: buildBackupPayload,
+    runBackup: function () { return runBackup({ auto: false }); },
+    scheduleBackup: scheduleBackup,
+    githubErrorText: githubErrorText,
+    tokenLooksValid: tokenLooksValid,
+    getBackupState: function () {
+      return {
+        owner: githubOwner,
+        repo: githubRepo,
+        hasToken: !!githubToken,
+        lastBackupAt: lastBackupAt,
+        lastRestoreAt: lastRestoreAt,
+        backupPending: backupPending,
+        backupStatus: backupStatus,
+        backupBusy: backupBusy,
+        changedDuringUpload: changedDuringUpload
+      };
+    },
+    failNextReplace: function () { failNextReplace = true; }
   };
 })();

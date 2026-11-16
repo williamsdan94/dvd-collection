@@ -44,7 +44,7 @@
   }
 
   // Looks up a barcode. Returns { ok, title } or { ok:false, reason, code }.
-  // reason is 'no-relay' | 'offline' | 'not_found' | 'busy' | 'daily_limit' |
+  // reason is 'no-relay' | 'offline' | 'not_found' | 'busy' | 'upstream_busy' | 'daily_limit' |
   //           'invalid' | 'upstream' | 'http'.
   function lookupBarcode(code) {
     var digits = String(code || '').replace(/\D/g, '');
@@ -60,7 +60,9 @@
           return { ok: true, title: String(data.title) };
         }
         var err = data && data.error;
-        var known = { not_found: 1, busy: 1, daily_limit: 1, invalid: 1, upstream: 1 };
+        // The relay says who refused: UPCitemdb's shared free limit, or our own limiter.
+        if (err === 'busy' && data && data.cause === 'upstream_busy') err = 'upstream_busy';
+        var known = { not_found: 1, busy: 1, upstream_busy: 1, daily_limit: 1, invalid: 1, upstream: 1 };
         return { ok: false, reason: known[err] ? err : 'http', status: res.status, code: digits };
       });
     }).catch(function () {
@@ -72,7 +74,8 @@
   function barcodeReasonText(reason) {
     switch (reason) {
       case 'not_found': return 'This barcode isn\'t in the free barcode database.';
-      case 'busy': return 'Lookup service busy. Wait a minute and scan again.';
+      case 'busy': return 'Too many scans in the last minute. Wait a minute and scan again.';
+      case 'upstream_busy': return 'The free barcode database is busy right now. Wait a minute, then tap Try the lookup again, or type the title.';
       case 'daily_limit': return 'Daily lookup limit reached. Type the title, or scan again tomorrow.';
       case 'invalid': return 'That barcode number doesn\'t look valid. Check it against the case.';
       case 'upstream': return 'The barcode database had a problem. Try again in a minute.';

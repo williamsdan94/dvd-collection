@@ -3,9 +3,9 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <!-- Safety lock: only this site, Wikipedia, TMDB images, and the dvd-relay Worker.
+  <!-- Safety lock: only this site, Wikipedia, TMDB images, the dvd-relay Worker, and the GitHub API (backup).
        RELAY ORIGIN: https://dvd-relay.williamsdan94.workers.dev -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' blob: data: https://upload.wikimedia.org https://en.wikipedia.org https://image.tmdb.org; worker-src 'self' blob:; connect-src 'self' blob: data: https://en.wikipedia.org https://upload.wikimedia.org https://dvd-relay.williamsdan94.workers.dev https://image.tmdb.org; media-src 'self' blob: mediastream:; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; img-src 'self' blob: data: https://upload.wikimedia.org https://en.wikipedia.org https://image.tmdb.org; worker-src 'self' blob:; connect-src 'self' blob: data: https://en.wikipedia.org https://upload.wikimedia.org https://dvd-relay.williamsdan94.workers.dev https://image.tmdb.org https://api.github.com; media-src 'self' blob: mediastream:; style-src 'self'; object-src 'none'; base-uri 'self'; form-action 'none'">
   <meta name="robots" content="noindex, nofollow">
   <meta name="referrer" content="no-referrer">
   <meta name="theme-color" content="#2A2A2C">

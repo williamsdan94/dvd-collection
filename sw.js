@@ -2,7 +2,7 @@
    One versioned cache: bump SHELL on every publish so phones update.
    Network first (so a new publish shows up), and only successful (res.ok)
    responses are saved. When offline, use the saved copy. */
-var SHELL = 'dvd-v1-5';
+var SHELL = 'dvd-v1-8';
 var ASSETS = [
   './',
   './index.html',
