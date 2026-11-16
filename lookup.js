@@ -36,23 +36,50 @@
 
   // ----- Relay (stubbed while RELAY_URL is empty) -----
 
-  // Looks up a barcode. Returns { ok, title } or { ok:false, reason }.
-  // reason is 'no-relay' | 'offline' | 'http' | 'empty'.
+  // Relay requests must stay "simple" CORS requests: only safelisted headers.
+  // (v1-4 sent Api-User-Agent here, the relay's preflight refused it, and
+  // every barcode lookup from the phone failed.)
+  function relayHeaders() {
+    return { 'Accept': 'application/json' };
+  }
+
+  // Looks up a barcode. Returns { ok, title } or { ok:false, reason, code }.
+  // reason is 'no-relay' | 'offline' | 'not_found' | 'busy' | 'daily_limit' |
+  //           'invalid' | 'upstream' | 'http'.
   function lookupBarcode(code) {
+    var digits = String(code || '').replace(/\D/g, '');
     var origin = relayOrigin();
     if (!origin) {
-      return Promise.resolve({ ok: false, reason: 'no-relay' });
+      return Promise.resolve({ ok: false, reason: 'no-relay', code: digits });
     }
-    var url = origin + '/upc?code=' + encodeURIComponent(String(code || '').trim());
-    return fetch(url, { headers: apiHeaders() }).then(function (res) {
-      if (!res.ok) return { ok: false, reason: 'http' };
-      return res.json().then(function (data) {
-        if (!data || !data.title) return { ok: false, reason: 'empty' };
-        return { ok: true, title: String(data.title) };
+    var url = origin + '/upc?code=' + encodeURIComponent(digits);
+    return fetch(url, { headers: relayHeaders() }).then(function (res) {
+      return res.json().catch(function () { return null; }).then(function (data) {
+        if (res.ok) {
+          if (!data || !data.title) return { ok: false, reason: 'not_found', code: digits };
+          return { ok: true, title: String(data.title) };
+        }
+        var err = data && data.error;
+        var known = { not_found: 1, busy: 1, daily_limit: 1, invalid: 1, upstream: 1 };
+        return { ok: false, reason: known[err] ? err : 'http', status: res.status, code: digits };
       });
     }).catch(function () {
-      return { ok: false, reason: 'offline' };
+      return { ok: false, reason: 'offline', code: digits };
     });
+  }
+
+  // Plain-English reason for the "Couldn't find it" screen.
+  function barcodeReasonText(reason) {
+    switch (reason) {
+      case 'not_found': return 'This barcode isn\'t in the free barcode database.';
+      case 'busy': return 'Lookup service busy. Wait a minute and scan again.';
+      case 'daily_limit': return 'Daily lookup limit reached. Type the title, or scan again tomorrow.';
+      case 'invalid': return 'That barcode number doesn\'t look valid. Check it against the case.';
+      case 'upstream': return 'The barcode database had a problem. Try again in a minute.';
+      case 'offline': return 'No connection to the lookup service. Check your internet and try again.';
+      case 'no-relay': return 'Barcode lookup isn\'t set up.';
+      default: return 'Lookup failed. Try again in a minute.';
+    }
   }
 
   // Looks up cover art and year for a title. Tries the relay (TMDB) first
@@ -67,7 +94,7 @@
     if (origin) {
       var url = origin + '/movie?title=' + encodeURIComponent(typed);
       if (year) url += '&year=' + encodeURIComponent(year);
-      start = fetch(url, { headers: apiHeaders() }).then(function (res) {
+      start = fetch(url, { headers: relayHeaders() }).then(function (res) {
         if (!res.ok) return null;
         return res.json().then(function (data) {
           if (!data || !data.title) return null;
@@ -232,6 +259,7 @@
     RELAY_URL: RELAY_URL,
     TMDB_ENABLED: TMDB_ENABLED,
     lookupBarcode: lookupBarcode,
+    barcodeReasonText: barcodeReasonText,
     lookupMovie: lookupMovie,
     lookupWikipedia: lookupWikipedia,
     downloadPoster: downloadPoster,

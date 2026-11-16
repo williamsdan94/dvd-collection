@@ -428,8 +428,14 @@
     DvdScan.startCamera(video, function (hit) {
       if (!hit || !hit.text) return;
       onBarcode(hit.text);
-    }).catch(function () {
-      setScanError('Camera is not available. Snap the cover or type the title.');
+    }).catch(function (err) {
+      if (err && err.kind === 'library') {
+        setScanError('The barcode scanner didn\'t load. Close the app, open it again, and retry. You can also type the title.');
+      } else if (err && err.name === 'NotAllowedError') {
+        setScanError('Camera access is off. Allow the camera for this app in Settings, or type the title.');
+      } else {
+        setScanError('Camera is not available. Snap the cover or type the title.');
+      }
     });
   }
 
@@ -455,7 +461,10 @@
       '<div class="topbar"><button type="button" class="link" data-action="scan">Back</button>' +
       '<h2>Add a title</h2><span class="spacer"></span></div>' +
       '<div class="form">' +
-      '<p class="msg">' + (d.missed ? 'Couldn\'t find it. Type the title and we\'ll add it.' : 'Type the title and we\'ll add it.') + '</p>' +
+      '<p class="msg">' + (d.missed ? (d.missKind && d.missKind !== 'not_found' ? 'Couldn\'t look it up right now. Type the title and we\'ll add it.' : 'Couldn\'t find it. Type the title and we\'ll add it.') : 'Type the title and we\'ll add it.') + '</p>' +
+      (d.missed && d.missReason ? '<p class="miss-reason" id="miss-reason">' + esc(d.missReason) + '</p>' : '') +
+      (d.missed && d.barcode ? '<p class="miss-code" id="miss-code">Barcode ' + esc(d.barcode) + '</p>' : '') +
+      (d.missed && d.canRetry ? '<button type="button" class="btn-small" data-action="retry-barcode">Try the lookup again</button>' : '') +
       (d.coverBlob ? '<div class="cover-lg"><img id="draft-cover" alt="Cover photo"></div>' : '') +
       '<div class="field"><label for="f-title">Title</label>' +
       '<input id="f-title" class="inp" type="text" autocomplete="off" enterkeyhint="done" value="' + esc(d.title || '') + '"></div>' +
@@ -613,7 +622,11 @@
     DvdLookup.lookupBarcode(draft.barcode).then(function (res) {
       if (gen !== lookupGen) return;
       if (!res || !res.ok) {
+        var reason = (res && res.reason) || 'http';
         draft.missed = true;
+        draft.missKind = reason;
+        draft.missReason = DvdLookup.barcodeReasonText ? DvdLookup.barcodeReasonText(reason) : '';
+        draft.canRetry = reason !== 'not_found' && reason !== 'invalid' && reason !== 'daily_limit';
         show('missed');
         return;
       }
@@ -823,6 +836,10 @@
     if (action === 'snap-cover') {
       if (window.DvdScan) DvdScan.stopCamera();
       coverInput.click();
+      return;
+    }
+    if (action === 'retry-barcode') {
+      if (draft && draft.barcode) return onBarcode(draft.barcode, true);
       return;
     }
     if (action === 'cancel-lookup') { lookupGen += 1; return show('home'); }
